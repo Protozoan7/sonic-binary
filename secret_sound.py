@@ -1,3 +1,11 @@
+#
+#
+# pip install numpy scipy sounddevice cryptography
+#
+#
+
+
+
 import os
 import hashlib
 import numpy as np
