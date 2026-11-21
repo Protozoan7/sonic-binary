@@ -1,0 +1,310 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Secret Sound</title>
+<style>
+body { font-family: sans-serif; max-width: 500px; margin: 20px auto; padding: 0 15px; }
+input, textarea, button { font-size: 18px; width: 100%; box-sizing: border-box; margin: 5px 0 15px; padding: 8px; }
+#msgbox { font-size: 22px; font-family: monospace; word-wrap: break-word; }
+</style>
+</head>
+<body>
+
+<h2>Secret Sound</h2>
+
+Password:
+<input id="pw" value="snucphysics">
+
+<h3>Receive</h3>
+<button id="listen">Start listening</button>
+<p id="status">Not listening</p>
+<p id="msgbox"></p>
+
+<h3>Send</h3>
+<textarea id="msg" rows="3">my name is avikshit</textarea>
+<button id="send">Send</button>
+<p id="sendstatus"></p>
+
+<script>
+const bitTime = 0.03;
+const tones = [[17600, 17900], [18200, 18500], [18800, 19100], [19400, 19700]];
+
+let ctx, rate, bit, stream, mic, node, timer;
+let queue = [], audio = new Float32Array(0), start = null, got = [], busy = false;
+
+async function getKey(type, use) {
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(document.getElementById("pw").value));
+  return crypto.subtle.importKey("raw", new Uint8Array(hash).slice(0, 16), type, false, [use]);
+}
+
+async function lock(msg) {
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const enc = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, await getKey("AES-GCM", "encrypt"), new TextEncoder().encode(msg));
+  return [...nonce, ...new Uint8Array(enc)];
+}
+
+async function unlock(data) {
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: data.slice(0, 12) }, await getKey("AES-GCM", "decrypt"), data.slice(12));
+  return new TextDecoder().decode(plain);
+}
+
+async function unlockPart(nonce, part) {
+  const counter = new Uint8Array(16);
+  counter.set(nonce);
+  counter[15] = 2;
+  const plain = await crypto.subtle.decrypt({ name: "AES-CTR", counter: counter, length: 32 }, await getKey("AES-CTR", "decrypt"), part);
+  return new TextDecoder().decode(plain);
+}
+
+function fade(x, n) {
+  for (let i = 0; i < n; i++) {
+    x[i] *= i / (n - 1);
+    x[x.length - 1 - i] *= i / (n - 1);
+  }
+  return x;
+}
+
+function tone(f, length) {
+  const x = new Float32Array(Math.floor(rate * length));
+  for (let i = 0; i < x.length; i++) x[i] = Math.sin(2 * Math.PI * f * i / rate);
+  return fade(x, Math.floor(rate * 0.002));
+}
+
+function startSound() {
+  const x = new Float32Array(Math.floor(rate * 0.1));
+  for (let i = 0; i < x.length; i++) {
+    const t = i / rate;
+    x[i] = Math.cos(2 * Math.PI * (17300 * t + 14500 * t * t));
+  }
+  return fade(x, Math.floor(rate * 0.005));
+}
+
+// keep only 17 - 20.5 kHz
+function filter(input) {
+  const x = Float64Array.from(input);
+  const parts = [["hp", 17000, 0.5412], ["hp", 17000, 1.3066], ["lp", Math.min(20500, 0.47 * rate), 0.5412], ["lp", Math.min(20500, 0.47 * rate), 1.3066]];
+  for (let pass = 0; pass < 2; pass++) {
+    for (const [type, f, q] of parts) {
+      const w = 2 * Math.PI * f / rate, c = Math.cos(w), a = Math.sin(w) / (2 * q);
+      let b = type == "lp" ? [(1 - c) / 2, 1 - c, (1 - c) / 2] : [(1 + c) / 2, -(1 + c), (1 + c) / 2];
+      b = b.map(v => v / (1 + a));
+      const a1 = -2 * c / (1 + a), a2 = (1 - a) / (1 + a);
+      let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+      for (let i = 0; i < x.length; i++) {
+        const y = b[0] * x[i] + b[1] * x1 + b[2] * x2 - a1 * y1 - a2 * y2;
+        x2 = x1; x1 = x[i]; y2 = y1; y1 = y; x[i] = y;
+      }
+    }
+    x.reverse();
+  }
+  return x;
+}
+
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let k = n >> 1;
+    for (; j & k; k >>= 1) j ^= k;
+    j ^= k;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+  }
+  for (let len = 2; len <= n; len *= 2) {
+    const wr = Math.cos(-2 * Math.PI / len), wi = Math.sin(-2 * Math.PI / len);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const a = i + k, b = a + len / 2;
+        const tr = re[b] * cr - im[b] * ci, ti = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+        const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+      }
+    }
+  }
+}
+
+function strength(x, f) {
+  let re = 0, im = 0;
+  for (let i = 0; i < x.length; i++) {
+    const v = x[i] * 0.5 * (1 - Math.cos(2 * Math.PI * i / (x.length - 1)));
+    re += v * Math.cos(2 * Math.PI * f * i / rate);
+    im -= v * Math.sin(2 * Math.PI * f * i / rate);
+  }
+  return re * re + im * im;
+}
+
+function median(a) {
+  a = [...a].sort((p, q) => p - q);
+  return a.length ? a[Math.floor(a.length / 2)] : 1;
+}
+
+function findStart(sound) {
+  const ref = startSound(), x = filter(sound);
+  let n = 1;
+  while (n < x.length + ref.length) n *= 2;
+  const ar = new Float64Array(n), ai = new Float64Array(n), br = new Float64Array(n), bi = new Float64Array(n);
+  ar.set(x); br.set(ref);
+  fft(ar, ai); fft(br, bi);
+  for (let k = 0; k < n; k++) {
+    const r = ar[k] * br[k] + ai[k] * bi[k], i = ai[k] * br[k] - ar[k] * bi[k];
+    ar[k] = r; ai[k] = -i;
+  }
+  fft(ar, ai);
+  let refPower = 0;
+  for (const v of ref) refPower += v * v;
+  const sum = [0];
+  for (let i = 0; i < x.length; i++) sum.push(sum[i] + x[i] * x[i]);
+  const match = [];
+  for (let p = 0; p < x.length - ref.length - rate * 0.05; p++) {
+    const power = Math.max(sum[p + ref.length] - sum[p], 0);
+    match.push(Math.abs(ar[p]) / n / Math.sqrt(refPower * power + 1e-12));
+  }
+  // 1 = sounds exactly like the start sound, 0 = nothing like it
+  let best = 0;
+  for (const m of match) if (m > best) best = m;
+  if (best < 0.4) return null;
+  return match.findIndex(m => m >= 0.8 * best);
+}
+
+function readByte(x, first, n) {
+  let byte = 0;
+  const loudest = [];
+  for (let i = n * 8; i < n * 8 + 8; i++) {
+    // skip the first 30% of the bit, thats where the echo of the last bit is
+    const part = x.subarray(first + i * bit + Math.floor(bit * 0.3), first + (i + 1) * bit - Math.floor(rate * 0.002));
+    const e0 = strength(part, tones[i % 4][0]), e1 = strength(part, tones[i % 4][1]);
+    byte = byte * 2 + (e1 > e0 ? 1 : 0);
+    loudest.push(Math.max(e0, e1));
+  }
+  return [byte, median(loudest)];
+}
+
+async function check() {
+  if (busy || queue.length == 0) return;
+  busy = true;
+  for (const c of queue.splice(0)) {
+    const a = new Float32Array(audio.length + c.length);
+    a.set(audio); a.set(c, audio.length); audio = a;
+  }
+
+  if (start === null) {
+    if (audio.length > 2 * rate) audio = audio.slice(audio.length - 2 * rate);
+    const from = Math.max(0, audio.length - rate);
+    const found = findStart(audio.subarray(from));
+    if (found !== null) start = from + found;
+    busy = false;
+    return;
+  }
+
+  const first = start + Math.floor(rate * 0.12);
+  const ready = Math.floor((audio.length - rate / 10 - first) / (8 * bit));
+  if (ready < 1) { busy = false; return; }
+  const x = filter(audio);
+
+  if (got.length == 0) {
+    const [size, loud] = readByte(x, first, 0);
+    const noise = [];
+    for (let j = Math.max(0, start - rate / 4); j < start - bit; j += bit) noise.push(strength(x.subarray(j, j + bit), 18500));
+    if (size < 29 || loud < 10 * median(noise)) {
+      audio = audio.slice(start + Math.floor(rate * 0.1));
+      start = null;
+      busy = false;
+      return;
+    }
+    got = [size];
+    document.getElementById("status").textContent = "Start signal heard, receiving...";
+  }
+
+  const size = got[0];
+  while (got.length < Math.min(ready, size + 1)) got.push(readByte(x, first, got.length)[0]);
+
+  if (got.length > 13) {
+    const part = new Uint8Array(got.slice(13, Math.min(got.length, size - 15)));
+    if (part.length) document.getElementById("msgbox").textContent = await unlockPart(new Uint8Array(got.slice(1, 13)), part);
+  }
+
+  if (got.length == size + 1) {
+    stopListening();
+    try {
+      document.getElementById("msgbox").textContent = await unlock(new Uint8Array(got.slice(1)));
+      document.getElementById("status").textContent = "Message received (checked OK)";
+    } catch (e) {
+      document.getElementById("status").textContent = "Could not unlock it (wrong password or damaged)";
+    }
+  }
+  busy = false;
+}
+
+async function startListening() {
+  ctx = ctx || new AudioContext();
+  await ctx.resume();
+  rate = ctx.sampleRate;
+  bit = Math.floor(rate * bitTime);
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  } catch (e) {
+    document.getElementById("status").textContent = "Microphone not allowed";
+    return;
+  }
+  mic = ctx.createMediaStreamSource(stream);
+  node = ctx.createScriptProcessor(16384, 1, 1);
+  node.onaudioprocess = e => queue.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  const silent = ctx.createGain();
+  silent.gain.value = 0;
+  mic.connect(node); node.connect(silent); silent.connect(ctx.destination);
+  audio = new Float32Array(0); start = null; got = []; queue = [];
+  document.getElementById("msgbox").textContent = "";
+  document.getElementById("status").textContent = "Listening...";
+  document.getElementById("listen").textContent = "Stop listening";
+  timer = setInterval(check, 250);
+}
+
+function stopListening() {
+  clearInterval(timer);
+  timer = null;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (node) node.disconnect();
+  document.getElementById("listen").textContent = "Start listening";
+}
+
+document.getElementById("listen").onclick = () => {
+  if (timer) {
+    stopListening();
+    document.getElementById("status").textContent = "Not listening";
+  } else {
+    startListening();
+  }
+};
+
+document.getElementById("send").onclick = async () => {
+  ctx = ctx || new AudioContext();
+  await ctx.resume();
+  rate = ctx.sampleRate;
+  const data = await lock(document.getElementById("msg").value.slice(0, 200));
+  data.unshift(data.length);
+  const bits = [];
+  for (const byte of data) for (let i = 7; i >= 0; i--) bits.push((byte >> i) & 1);
+
+  const parts = [new Float32Array(Math.floor(rate * 0.3)), startSound(), new Float32Array(Math.floor(rate * 0.02))];
+  for (let i = 0; i < bits.length; i++) parts.push(tone(tones[i % 4][bits[i]], bitTime));
+  parts.push(new Float32Array(Math.floor(rate * 0.3)));
+
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const sound = new Float32Array(total);
+  let pos = 0;
+  for (const p of parts) { for (let i = 0; i < p.length; i++) sound[pos + i] = 0.6 * p[i]; pos += p.length; }
+
+  const buffer = ctx.createBuffer(1, sound.length, rate);
+  buffer.copyToChannel(sound, 0);
+  const player = ctx.createBufferSource();
+  player.buffer = buffer;
+  player.connect(ctx.destination);
+  player.onended = () => document.getElementById("sendstatus").textContent = "Sent!";
+  document.getElementById("sendstatus").textContent = "Sending " + bits.length + " bits (" + (sound.length / rate).toFixed(1) + " s)...";
+  player.start();
+};
+</script>
+</body>
+</html>
