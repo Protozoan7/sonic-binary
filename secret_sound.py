@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 rate = 48000
 bit_time = 0.03
-password = "snucphysics"
+password = input("Password: ")
 
 # (tone for 0, tone for 1). bits take turns using these 4 pairs so echoes dont mix up the bits
 tones = [(17600, 17900), (18200, 18500), (18800, 19100), (19400, 19700)]
