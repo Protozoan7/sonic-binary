@@ -176,8 +176,10 @@ while True:
     print("3. Exit")
     choice = input("Choose: ")
     if choice == "1":
+        password = input("Password: ")
         send()
     elif choice == "2":
+        password = input("Password: ")
         receive()
     elif choice == "3":
         break
